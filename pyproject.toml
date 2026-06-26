@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdbo"
+version = "0.1.0"
+description = "Primal-Dual optimization for binary optimization problems."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+dependencies = [
+    "jax",
+    "jaxlib",
+    "networkx",
+    "numpy",
+    "optax",
+    "scipy",
+]
+
+[project.optional-dependencies]
+gurobi = ["gurobipy"]
+test = ["pytest"]
+
+[tool.setuptools]
+py-modules = ["main", "problem_parser", "solver_jax", "utils"]
+packages = ["pdbo"]
