@@ -20,6 +20,7 @@ from pdbo import (
     random_graph,
     refine_binary_incumbent,
 )
+from solver_jax import G_TYPES
 from utils import fix_seed
 
 
@@ -50,6 +51,8 @@ def build_parser():
     parser.add_argument("--min_delta", type=float, default=0.0)
     parser.add_argument("--check_every", type=int, default=1)
     parser.add_argument("--quadratic_backend", choices=["edge", "sparse"], default="sparse")
+    parser.add_argument("--g", choices=list(G_TYPES), default="quad")
+    parser.add_argument("--g_normalize", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--rounding_samples", type=int, default=0)
     parser.add_argument("--perturbation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--perturbation_strength", type=float, default=0.4)
@@ -151,6 +154,8 @@ def build_solver(args, data):
         min_delta=args.min_delta,
         check_every=args.check_every,
         quadratic_backend=args.quadratic_backend,
+        g_type=args.g,
+        g_normalize=args.g_normalize,
         rounding_samples=args.rounding_samples,
         perturbation=args.perturbation,
         perturbation_strength=args.perturbation_strength,

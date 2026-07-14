@@ -1,3 +1,4 @@
+import math
 import time
 from dataclasses import dataclass
 from jax.experimental import sparse
@@ -6,6 +7,23 @@ import jax.numpy as jnp
 import optax
 from typing import Tuple, Optional, Callable
 import numpy as np
+
+
+# Constraint functions g(x) selectable via g_type. All satisfy the paper's
+# structural conditions (symmetric on [0,1], g(0)=g(1)=0, unique interior
+# stationary point at x=1/2, g(x)<=0).
+#   G_TYPES_CONVEX  : convex on the whole [0,1] with strictly positive curvature
+#                     somewhere (drives the "convex initialization" mechanism).
+#   G_TYPES_PARTIAL : convex only near x=1/2, concave near the edges (controls).
+#   G_TYPES_LINEAR  : piecewise-linear V-shape, curvature 0 almost everywhere
+#                     (an exact-penalty control: cannot convexify the objective).
+G_TYPES_CONVEX = (
+    "quad", "poly4", "poly6", "poly8", "abs_pow3", "abs_pow1p5",
+    "entropy", "sin", "semicircle", "cosh",
+)
+G_TYPES_PARTIAL = ("quartic_well", "sin2")
+G_TYPES_LINEAR = ("vshape",)
+G_TYPES = G_TYPES_CONVEX + G_TYPES_PARTIAL + G_TYPES_LINEAR
 
 
 @dataclass(frozen=True)
@@ -167,6 +185,8 @@ class PDBO_JAX:
             min_delta: float = 0.0,
             check_every: int = 1,
             quadratic_backend: str = 'sparse',
+            g_type: str = 'quad',
+            g_normalize: bool = False,
             rounding_samples: int = 0,
             perturbation: bool = False,
             perturbation_strength: float = 0.4,
@@ -179,6 +199,7 @@ class PDBO_JAX:
         assert optimizer_type in {'rmsprop', 'adam'}, "Invalid optimizer type"
         assert primal_init in {'uniform', 'half', 'binary'}, "Invalid primal init"
         assert quadratic_backend in {'edge', 'sparse'}, "Invalid quadratic backend"
+        assert g_type in G_TYPES, f"Invalid g_type: {g_type}"
         if patience is not None and patience < 1:
             raise ValueError("patience must be positive or None")
         if check_every < 1:
@@ -206,6 +227,8 @@ class PDBO_JAX:
         self.min_delta = min_delta
         self.check_every = check_every
         self.quadratic_backend = quadratic_backend
+        self.g_type = g_type
+        self.g_normalize = g_normalize
         self.rounding_samples = rounding_samples
         self.perturbation = perturbation
         self.perturbation_strength = perturbation_strength
@@ -306,6 +329,72 @@ class PDBO_JAX:
             return optax.rmsprop(lr, decay=0.98, eps=1e-8, momentum=0.91)
         return optax.adam(lr, b1=0.9, b2=0.999, eps=1e-8)
 
+    def _make_g(self) -> Callable:
+        """Return the binarity constraint function g(x) selected by ``self.g_type``.
+
+        Every choice satisfies the structural conditions from the paper (Section 3.1):
+        symmetric on [0, 1], g(0) = g(1) = 0, the unique interior stationary point at
+        x = 1/2, and g(x) <= 0 (so the dual variables decrease monotonically). See the
+        ``G_TYPES_*`` groups for which are fully convex / partially convex / linear.
+
+        When ``self.g_normalize`` is set, g is rescaled so its minimum depth |g(1/2)| is
+        1, i.e. the value range becomes exactly [-1, 0]. This isolates the shape of g
+        from its scale (the dual update y += beta*g(x) is otherwise sensitive to depth).
+        """
+        a = 2.0        # cosh sharpness
+        cosh_a = math.cosh(a)
+        eps = 1e-7     # guard log(0) / division-by-zero near the binary points
+
+        def quad(x):        return x ** 2 - x
+        def poly4(x):       return (2.0 * x - 1.0) ** 4 - 1.0
+        def poly6(x):       return (2.0 * x - 1.0) ** 6 - 1.0
+        def poly8(x):       return (2.0 * x - 1.0) ** 8 - 1.0
+        def abs_pow3(x):    return jnp.abs(2.0 * x - 1.0) ** 3 - 1.0
+        def abs_pow1p5(x):  return jnp.abs(2.0 * x - 1.0) ** 1.5 - 1.0
+
+        def entropy(x):
+            xc = jnp.clip(x, eps, 1.0 - eps)
+            return xc * jnp.log(xc) + (1.0 - xc) * jnp.log(1.0 - xc)
+
+        def sin_g(x):       return -jnp.sin(jnp.pi * x)
+
+        def semicircle(x):
+            xc = jnp.clip(x, 1e-6, 1.0 - 1e-6)  # keep sqrt argument strictly positive
+            return -jnp.sqrt(xc - xc ** 2)
+
+        # cosh, pre-scaled so its native range is already [-1, 0] (raw depth would be
+        # cosh(a)-1 ~= 2.76, an outlier that would dominate the dual update otherwise)
+        def cosh_g(x):      return (jnp.cosh(a * (2.0 * x - 1.0)) - cosh_a) / (cosh_a - 1.0)
+
+        # partially convex: convex near x=1/2, concave near the edges
+        def quartic_well(x): return -(x - x ** 2) ** 2
+        def sin2(x):         return -jnp.sin(jnp.pi * x) ** 2
+
+        # piecewise-linear V-shape (curvature 0 a.e.): an exact-penalty control
+        def vshape(x):      return jnp.abs(2.0 * x - 1.0) - 1.0
+
+        # (function, minimum depth |g(1/2)|) used for optional [-1, 0] normalization
+        table = {
+            "quad": (quad, 0.25),
+            "poly4": (poly4, 1.0),
+            "poly6": (poly6, 1.0),
+            "poly8": (poly8, 1.0),
+            "abs_pow3": (abs_pow3, 1.0),
+            "abs_pow1p5": (abs_pow1p5, 1.0),
+            "entropy": (entropy, math.log(2.0)),
+            "sin": (sin_g, 1.0),
+            "semicircle": (semicircle, 0.5),
+            "cosh": (cosh_g, 1.0),
+            "quartic_well": (quartic_well, 0.0625),
+            "sin2": (sin2, 1.0),
+            "vshape": (vshape, 1.0),
+        }
+        fn, depth = table[self.g_type]
+        if self.g_normalize:
+            scale = 1.0 / depth  # rescale minimum depth to 1 -> value range [-1, 0]
+            return lambda x: fn(x) * scale
+        return fn
+
     def _score_incumbent(self, x):
         if self.incumbent_score_fn is not None:
             return self.incumbent_score_fn(x[jnp.newaxis, :])[0]
@@ -314,12 +403,13 @@ class PDBO_JAX:
     def optimize(self):
         self.start_time = time.perf_counter()
         batch_obj = jax.vmap(self.objective_fn, in_axes=0)
+        g_fn = self._make_g()
 
         def base_term(x):
             return batch_obj(x).sum()
 
         def penalty_term(x, y):
-            return (y * (x ** 2 - x)).sum()
+            return (y * g_fn(x)).sum()
 
         grad_x_fn = jax.grad(lambda x, y: base_term(x) + penalty_term(x, y), argnums=0)
 
@@ -329,7 +419,7 @@ class PDBO_JAX:
             updates_x, opt_state_x = self.optimizer_primal.update(grad_x, opt_state_x, x)
             x = optax.apply_updates(x, updates_x)
             x = jnp.clip(x, 0.0, 1.0)
-            y += self.dual_lr * (x ** 2 - x)
+            y += self.dual_lr * g_fn(x)
 
             int_x = jax.lax.stop_gradient(jnp.round(x))
             int_x = jnp.concatenate((int_x, incumbent[jnp.newaxis, :]), axis=0)
@@ -399,6 +489,17 @@ class PDBO_JAX:
             self.stop_reason = "max_iters"
 
         self.solving_time = time.perf_counter() - self.start_time
+
+        # Convergence diagnostics (for deciding whether a run is comparable):
+        #   - fractionality x*(1-x) in [0, 0.25], g-independent so fair across g's;
+        #     0 means the relaxed primal has fully settled onto a binary point.
+        #   - last_improvement_step: when the incumbent objective last improved; if it
+        #     is near max_iters the run was probably still climbing at the budget.
+        frac = self.primal * (1.0 - self.primal)
+        self.final_integrality = float(frac.mean())              # over the whole batch
+        self.final_integrality_min = float(frac.mean(axis=1).min())  # most-binary init
+        self.last_improvement_step = int(last_improvement_step)
+
         if self.rounding_samples > 0:
             self.key, subkey = jax.random.split(self.key)
             sampled = jax.random.bernoulli(
