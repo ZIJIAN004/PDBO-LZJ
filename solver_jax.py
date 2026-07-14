@@ -19,7 +19,7 @@ import numpy as np
 #                     (an exact-penalty control: cannot convexify the objective).
 G_TYPES_CONVEX = (
     "quad", "poly4", "poly6", "poly8", "abs_pow3", "abs_pow1p5",
-    "entropy", "sin", "semicircle", "cosh",
+    "entropy", "sin", "semicircle", "cosh", "huber",
 )
 G_TYPES_PARTIAL = ("quartic_well", "sin2")
 G_TYPES_LINEAR = ("vshape",)
@@ -373,6 +373,15 @@ class PDBO_JAX:
         # piecewise-linear V-shape (curvature 0 a.e.): an exact-penalty control
         def vshape(x):      return jnp.abs(2.0 * x - 1.0) - 1.0
 
+        # Huber-smoothed V-shape: globally convex, but not strictly convex because
+        # the outer regions remain linear. Only the central band has positive curvature.
+        def huber(x, eps_h=0.05):
+            c = 2.0 / (1.0 - eps_h)  # normalize so g(1/2) = -1
+            t = x - 0.5
+            quad = (c / (2.0 * eps_h)) * t ** 2 - c * (1.0 - eps_h) / 2.0
+            lin = -c * (0.5 - jnp.abs(t))
+            return jnp.where(jnp.abs(t) <= eps_h, quad, lin)
+
         # (function, minimum depth |g(1/2)|) used for optional [-1, 0] normalization
         table = {
             "quad": (quad, 0.25),
@@ -385,6 +394,7 @@ class PDBO_JAX:
             "sin": (sin_g, 1.0),
             "semicircle": (semicircle, 0.5),
             "cosh": (cosh_g, 1.0),
+            "huber": (huber, 1.0),
             "quartic_well": (quartic_well, 0.0625),
             "sin2": (sin2, 1.0),
             "vshape": (vshape, 1.0),
