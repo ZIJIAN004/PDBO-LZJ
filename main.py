@@ -40,6 +40,20 @@ def build_parser():
     parser.add_argument("--lr_x", type=float, default=0.02)
     parser.add_argument("--lr_y", type=float, default=0.02)
     parser.add_argument("--dual_init", type=float, default=5)
+    parser.add_argument(
+        "--dual_init_mode",
+        choices=["constant", "curvature"],
+        default="constant",
+        help="constant y0 or a per-coordinate initialization with controlled initial Hessian curvature",
+    )
+    parser.add_argument(
+        "--hessian_init_level",
+        type=float,
+        default=0.0,
+        help="relative initial Hessian level for curvature mode: 0=PSD boundary, <0=nonconvex, >0=convex",
+    )
+    parser.add_argument("--curvature_tol", type=float, default=1e-12)
+    parser.add_argument("--eig_tol", type=float, default=1e-8)
     parser.add_argument("--primal_init", choices=["uniform", "half", "binary"], default="uniform")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--k", type=int, default=3)
@@ -128,6 +142,8 @@ def build_solver(args, data):
     }
 
     if args.task == "maxkcut" and args.k > 2:
+        if args.dual_init_mode != "constant":
+            raise ValueError("curvature dual initialization is not implemented for Max-k-Cut")
         return MaxKCutSolver(
             n_vars=data["num_vars"],
             Q_indices=data["Q_indices"],
@@ -138,6 +154,8 @@ def build_solver(args, data):
         )
 
     if args.task == "maxsat":
+        if args.dual_init_mode != "constant":
+            raise ValueError("curvature dual initialization is not implemented for MaxSAT")
         return MaxSatSolver(n_vars=data["num_vars"], CNF=data["CNF"], **common)
 
     incumbent_score_fn = labs_incumbent_score(args.labs_n) if args.task == "labs" else None
@@ -156,6 +174,10 @@ def build_solver(args, data):
         quadratic_backend=args.quadratic_backend,
         g_type=args.g,
         g_normalize=args.g_normalize,
+        dual_init_mode=args.dual_init_mode,
+        hessian_init_level=args.hessian_init_level,
+        curvature_tol=args.curvature_tol,
+        eig_tol=args.eig_tol,
         rounding_samples=args.rounding_samples,
         perturbation=args.perturbation,
         perturbation_strength=args.perturbation_strength,
@@ -176,6 +198,14 @@ def write_result(path, args, data, solver, solving_time, refinement=None):
         f.write("total time:" + str(solving_time) + "\n")
         f.write("stop reason:" + str(solver.stop_reason) + "\n")
         f.write("perturbations:" + str(getattr(solver, "perturbation_count", 0)) + "\n")
+        diagnostics = getattr(solver, "initial_curvature_diagnostics", None)
+        if diagnostics is not None:
+            f.write("initial objective lambda min:" + str(diagnostics.lambda_min) + "\n")
+            f.write("initial hessian lambda min:" + str(diagnostics.target_min_eigenvalue) + "\n")
+            f.write("initial curvature shift:" + str(diagnostics.curvature_shift) + "\n")
+            f.write("initial boundary residual:" + str(diagnostics.boundary_residual) + "\n")
+            f.write("initial dual min:" + str(solver.initial_dual_min) + "\n")
+            f.write("initial dual max:" + str(solver.initial_dual_max) + "\n")
         if refinement is not None:
             f.write("refined objective:" + str(refinement.objective) + "\n")
             f.write("refinement steps:" + str(refinement.steps) + "\n")
@@ -218,6 +248,9 @@ def main():
         write_result(out_path, args, data, solver, solving_time, refinement)
 
     message = f"best={float(solver.objVal)} time={solving_time:.6f}s stop={getattr(solver, 'stop_reason', None)}"
+    diagnostics = getattr(solver, "initial_curvature_diagnostics", None)
+    if diagnostics is not None:
+        message += f" init_lambda_min={diagnostics.target_min_eigenvalue:.6g}"
     if refinement is not None:
         message += f" refined_best={refinement.objective} refine_time={refinement.seconds:.6f}s"
     print(message)

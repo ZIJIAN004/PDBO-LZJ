@@ -103,6 +103,28 @@ result = solver.optimize()
 
 ## Options
 
+Initialize every parallel trajectory at the local PSD boundary of the
+Lagrangian Hessian (quadratic objectives and positive finite `g''(x0)` only):
+
+```bash
+python main.py --task mc --graph Gset --Gset_id 1 \
+    --dual_init_mode curvature --hessian_init_level 0
+```
+
+Use a negative relative level to start with controlled nonconvexity. For
+example, `-0.1` sets the initial smallest Hessian eigenvalue to 10% of the
+unpenalized negative curvature:
+
+```bash
+python main.py --task mc --graph Gset --Gset_id 1 \
+    --dual_init_mode curvature --hessian_init_level=-0.1
+```
+
+The solver uses coordinatewise dual values so different random starts and
+different constraint functions have the same initial Hessian curvature. See
+[`docs/hessian_initialization.md`](docs/hessian_initialization.md) for the
+derivation and the cases where no finite boundary initialization exists.
+
 Early stopping based on rounded incumbent stagnation:
 
 ```bash

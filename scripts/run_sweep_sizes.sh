@@ -26,7 +26,7 @@ SIZES="${SIZES:-small medium large}"   # which classes to run
 # ---- swept variables (same across all sizes so the comparison is controlled) ----
 YBAR="${YBAR:-0 1 2 4 6 8 10}"
 SEEDS="${SEEDS:-0 1 2}"
-# g list defaults to all 13 (10 convex + 2 partial + 1 linear); override with G_LIST="quad entropy ..."
+# g list defaults to all 14 (11 convex + 2 partial + 1 linear); override with G_LIST="quad entropy ..."
 G_LIST="${G_LIST:-}"
 
 # ---- fixed algorithm hyper-parameters (do NOT vary within one experiment) ----

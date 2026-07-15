@@ -9,14 +9,14 @@ from typing import Tuple, Optional, Callable
 import numpy as np
 
 
-# Constraint functions g(x) selectable via g_type. All satisfy the paper's
-# structural conditions (symmetric on [0,1], g(0)=g(1)=0, unique interior
-# stationary point at x=1/2, g(x)<=0).
-#   G_TYPES_CONVEX  : convex on the whole [0,1] with strictly positive curvature
-#                     somewhere (drives the "convex initialization" mechanism).
-#   G_TYPES_PARTIAL : convex only near x=1/2, concave near the edges (controls).
-#   G_TYPES_LINEAR  : piecewise-linear V-shape, curvature 0 almost everywhere
-#                     (an exact-penalty control: cannot convexify the objective).
+# Constraint functions g(x) selectable via g_type.
+#   G_TYPES_CONVEX  : satisfy the paper's C1 convexity conditions, but need not be
+#                     C2 or strongly convex. Some therefore cannot convexify a
+#                     coupled objective at every point.
+#   G_TYPES_PARTIAL : convex only near x=1/2, concave near the edges (controls that
+#                     do not satisfy the paper's global convexity condition).
+#   G_TYPES_LINEAR  : a convex V-shape that is nondifferentiable at x=1/2 and has
+#                     zero curvature almost everywhere (exact-penalty control).
 G_TYPES_CONVEX = (
     "quad", "poly4", "poly6", "poly8", "abs_pow3", "abs_pow1p5",
     "entropy", "sin", "semicircle", "cosh", "huber",
@@ -194,12 +194,32 @@ class PDBO_JAX:
             perturbation_patience: int = 200,
             perturbation_integrality_tol: float = 0.2,
             perturbation_reset_optimizer: bool = True,
+            dual_init_mode: str = 'constant',
+            hessian_init_level: float = 0.0,
+            curvature_tol: float = 1e-12,
+            eig_tol: float = 1e-8,
+            trusted_objective_hessian_lambda_min: Optional[float] = None,
     ):
         assert objective_type in {'quadratic', 'custom'}, "Invalid objective type"
         assert optimizer_type in {'rmsprop', 'adam'}, "Invalid optimizer type"
         assert primal_init in {'uniform', 'half', 'binary'}, "Invalid primal init"
         assert quadratic_backend in {'edge', 'sparse'}, "Invalid quadratic backend"
         assert g_type in G_TYPES, f"Invalid g_type: {g_type}"
+        if dual_init_mode not in {'constant', 'curvature'}:
+            raise ValueError("dual_init_mode must be 'constant' or 'curvature'")
+        if hessian_init_level < -1.0:
+            raise ValueError("hessian_init_level must be at least -1")
+        if curvature_tol < 0.0:
+            raise ValueError("curvature_tol must be non-negative")
+        if eig_tol <= 0.0:
+            raise ValueError("eig_tol must be positive")
+        if (
+                trusted_objective_hessian_lambda_min is not None
+                and not np.isfinite(trusted_objective_hessian_lambda_min)
+        ):
+            raise ValueError("trusted_objective_hessian_lambda_min must be finite or None")
+        if dual_init_mode == 'curvature' and objective_type != 'quadratic':
+            raise ValueError("curvature-matched dual initialization currently requires a quadratic objective")
         if patience is not None and patience < 1:
             raise ValueError("patience must be positive or None")
         if check_every < 1:
@@ -218,6 +238,11 @@ class PDBO_JAX:
         self.tolerance = tolerance
         self.primal_lr = primal_lr
         self.dual_lr = dual_lr
+        self.dual_init_mode = dual_init_mode
+        self.hessian_init_level = hessian_init_level
+        self.curvature_tol = curvature_tol
+        self.eig_tol = eig_tol
+        self.trusted_objective_hessian_lambda_min = trusted_objective_hessian_lambda_min
         self.max_iters = max_iters
         self.timelimit = timelimit
         self.verbose = verbose
@@ -271,6 +296,14 @@ class PDBO_JAX:
             self.objective_fn = objective_fn
 
         self.primal, self.dual = self._init_variables(dual_init, primal_init)
+        self.initial_curvature_diagnostics = None
+        self.initial_g_curvature_min = None
+        self.initial_g_curvature_max = None
+        if self.dual_init_mode == 'curvature':
+            self._initialize_curvature_matched_dual()
+        self.initial_dual_min = float(self.dual.min())
+        self.initial_dual_max = float(self.dual.max())
+        self.initial_dual_mean = float(self.dual.mean())
         self.incumbent = jnp.full(self.n, 0, dtype=jnp.float32)
         self.objVal = self._score_incumbent(self.incumbent)
         self.objVal_record = [self.objVal.item()]
@@ -324,6 +357,37 @@ class PDBO_JAX:
         dual = jnp.full((self.batch_size, self.n), dual_init, dtype=jnp.float32)
         return primal, dual
 
+    def _initialize_curvature_matched_dual(self):
+        """Match every initial Hessian to a common relative curvature level.
+
+        For A = grad^2 f and d_i = g''(x_i), this sets
+        y_i = shift / d_i. Hence diag(y * d) = shift * I for every batch,
+        despite different random primal initializations.
+        """
+        from pdbo.curvature import matched_dual_from_curvature, quadratic_hessian
+
+        g_fn = self._make_g()
+        g_second = jax.grad(jax.grad(g_fn))
+        curvature_fn = jax.vmap(jax.vmap(g_second))
+        curvature = np.asarray(curvature_fn(self.primal), dtype=np.float64)
+        hessian = quadratic_hessian(
+            np.asarray(self.Q_indices),
+            np.asarray(self.Q_values),
+            self.n,
+        )
+        dual, diagnostics = matched_dual_from_curvature(
+            hessian,
+            curvature,
+            relative_level=self.hessian_init_level,
+            trusted_objective_lambda_min=self.trusted_objective_hessian_lambda_min,
+            curvature_tol=self.curvature_tol,
+            eig_tol=self.eig_tol,
+        )
+        self.dual = jnp.asarray(dual, dtype=self.primal.dtype)
+        self.initial_curvature_diagnostics = diagnostics
+        self.initial_g_curvature_min = float(np.min(curvature))
+        self.initial_g_curvature_max = float(np.max(curvature))
+
     def _configure_optimizer(self, optimizer_type: str, lr: float) -> optax.GradientTransformation:
         if optimizer_type == 'rmsprop':
             return optax.rmsprop(lr, decay=0.98, eps=1e-8, momentum=0.91)
@@ -332,10 +396,10 @@ class PDBO_JAX:
     def _make_g(self) -> Callable:
         """Return the binarity constraint function g(x) selected by ``self.g_type``.
 
-        Every choice satisfies the structural conditions from the paper (Section 3.1):
-        symmetric on [0, 1], g(0) = g(1) = 0, the unique interior stationary point at
-        x = 1/2, and g(x) <= 0 (so the dual variables decrease monotonically). See the
-        ``G_TYPES_*`` groups for which are fully convex / partially convex / linear.
+        Every choice is symmetric, vanishes at the endpoints, and is nonpositive on
+        [0, 1], so the dual variables decrease monotonically. Only
+        ``G_TYPES_CONVEX`` satisfies all of the paper's differentiable convexity
+        conditions; see the group definitions for the experimental controls.
 
         When ``self.g_normalize`` is set, g is rescaled so its minimum depth |g(1/2)| is
         1, i.e. the value range becomes exactly [-1, 0]. This isolates the shape of g
@@ -573,6 +637,11 @@ class PDQUBO_JAX(PDBO_JAX):
             perturbation_patience: int = 200,
             perturbation_integrality_tol: float = 0.2,
             perturbation_reset_optimizer: bool = True,
+            dual_init_mode: str = 'constant',
+            hessian_init_level: float = 0.0,
+            curvature_tol: float = 1e-12,
+            eig_tol: float = 1e-8,
+            trusted_objective_hessian_lambda_min: Optional[float] = None,
     ):
         super().__init__(
             n_vars=n_vars,
@@ -586,6 +655,11 @@ class PDQUBO_JAX(PDBO_JAX):
             tolerance=tolerance,
             dual_lr=dual_lr,
             dual_init=dual_init,
+            dual_init_mode=dual_init_mode,
+            hessian_init_level=hessian_init_level,
+            curvature_tol=curvature_tol,
+            eig_tol=eig_tol,
+            trusted_objective_hessian_lambda_min=trusted_objective_hessian_lambda_min,
             max_iters=max_iters,
             timelimit=timelimit,
             seed=seed,

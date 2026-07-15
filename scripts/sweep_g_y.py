@@ -5,7 +5,7 @@ constant so the experiment isolates the effect of g and y-bar:
 
     fixed: task=maxcut, instance set, optimizer(rmsprop), batch B, primal_lr a,
            dual_lr b, max_iters T, primal_init, no perturbation / rounding / refine.
-    varied: g_type (13 forms: 10 convex + 2 partially convex + 1 linear control),
+    varied: g_type (14 forms: 11 convex + 2 partially convex + 1 linear control),
             dual_init (y-bar) over a grid, seed.
 
 Budget is by iteration count (max_iters), matching the paper's setting.
@@ -40,7 +40,7 @@ def build_parser():
                    help="Gset instance ids; the .txt files must exist in ./instance/Gset/")
     p.add_argument("--g", dest="g_types", nargs="+", default=list(G_TYPES),
                    choices=list(G_TYPES),
-                   help="constraint functions to sweep (10 convex + 2 partially convex + 1 linear control)")
+                   help="constraint functions to sweep (11 convex + 2 partially convex + 1 linear control)")
     p.add_argument("--g_normalize", action=argparse.BooleanOptionalAction, default=True,
                    help="rescale every g to value range [-1, 0] to compare shape not scale "
                         "(default on; use --no-g_normalize for the raw literature forms)")
