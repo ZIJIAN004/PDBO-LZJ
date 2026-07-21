@@ -37,7 +37,13 @@ MODES = (
     "dual_positive_hold",
     "random_branch",
     "gain_branch",
+    "global_y_zero_once",
+    "global_y_zero_hold",
+    "global_y_zero_resetopt",
+    "global_soft_recenter",
+    "full_random_restart",
 )
+DEFAULT_MODES = MODES[:7]
 
 RUN_FIELDS = (
     "instance",
@@ -62,6 +68,9 @@ RUN_FIELDS = (
     "hold_steps",
     "branch_strength",
     "positive_dual",
+    "recenter_scale",
+    "recenter_noise",
+    "flip_audit",
     "final_cut",
     "last_improve_iter",
     "final_integrality_mean",
@@ -124,7 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gset_ids", type=int, nargs="+", default=[67, 70, 72, 77, 81])
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=list(DEFAULT_MODES))
     parser.add_argument("--batch", type=int, default=100)
     parser.add_argument("--max_iters", type=int, default=5000)
     parser.add_argument("--lr_x", type=float, default=0.025)
@@ -141,7 +150,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hold_steps", type=int, default=100)
     parser.add_argument("--branch_strength", type=float, default=0.1)
     parser.add_argument("--positive_dual", type=float, default=0.5)
+    parser.add_argument("--recenter_scale", type=float, default=0.2)
+    parser.add_argument("--recenter_noise", type=float, default=0.01)
     parser.add_argument("--flip_tolerance", type=float, default=1e-6)
+    parser.add_argument("--skip_flip_audit", action="store_true")
     parser.add_argument("--allow_missing", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--out_prefix", default="results/reopening_g67_g81")
@@ -163,6 +175,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("branch_strength must lie in [0, 0.5]")
     if args.positive_dual <= 0.0 or not np.isfinite(args.positive_dual):
         raise ValueError("positive_dual must be positive and finite")
+    if not (0.0 <= args.recenter_scale <= 1.0):
+        raise ValueError("recenter_scale must lie in [0, 1]")
+    if not (0.0 <= args.recenter_noise <= 0.5):
+        raise ValueError("recenter_noise must lie in [0, 0.5]")
     if args.flip_tolerance < 0.0:
         raise ValueError("flip_tolerance must be non-negative")
 
@@ -220,6 +236,9 @@ def _empty_run_row(instance: str, mode: str, seed: int, data: dict, args) -> dic
             "hold_steps": args.hold_steps,
             "branch_strength": args.branch_strength,
             "positive_dual": args.positive_dual,
+            "recenter_scale": args.recenter_scale,
+            "recenter_noise": args.recenter_noise,
+            "flip_audit": not args.skip_flip_audit,
         }
     )
     return row
@@ -260,16 +279,21 @@ def run_one(instance: str, data: dict, mode: str, seed: int, args) -> tuple[dict
             reopening_dual_value=0.0,
             reopening_positive_value=args.positive_dual,
             reopening_reset_optimizer=True,
+            reopening_recenter_scale=args.recenter_scale,
+            reopening_noise=args.recenter_noise,
             seed=seed,
             verbose=False,
         )
         result = solver.optimize()
         final_cut = -float(result.objective)
-        improving_flips, best_flip_cut_gain = final_flip_audit(
-            data,
-            result.incumbent,
-            args.flip_tolerance,
-        )
+        if args.skip_flip_audit:
+            improving_flips, best_flip_cut_gain = "", ""
+        else:
+            improving_flips, best_flip_cut_gain = final_flip_audit(
+                data,
+                result.incumbent,
+                args.flip_tolerance,
+            )
         events = []
         for event in solver.reopening_events:
             cut_before = -float(event["objective_before"])
@@ -384,9 +408,10 @@ def summarize(rows: list[dict], tolerance: float) -> list[dict]:
             for row in group
             if np.isfinite(_float(row, "cut_improvement_after_first_event"))
         ]
-        local_optima = [
-            _float(row, "final_improving_one_flips") == 0.0 for row in group
+        improving_flip_counts = [
+            _float(row, "final_improving_one_flips") for row in group
         ]
+        local_optima = [value == 0.0 for value in improving_flip_counts if np.isfinite(value)]
         last_mean, _ = _mean_std([_float(row, "last_improve_iter") for row in group])
         time_mean, _ = _mean_std([_float(row, "time_s") for row in group])
         output.append(
@@ -405,7 +430,9 @@ def summarize(rows: list[dict], tolerance: float) -> list[dict]:
                 "post_event_improvement_rate": (
                     float(np.mean(np.asarray(post_event) > tolerance)) if post_event else ""
                 ),
-                "one_flip_local_optimum_rate": float(np.mean(local_optima)),
+                "one_flip_local_optimum_rate": (
+                    float(np.mean(local_optima)) if local_optima else ""
+                ),
                 "last_improve_iter_mean": last_mean,
                 "time_s_mean": time_mean,
             }
@@ -437,8 +464,11 @@ def validate_resume_rows(rows: list[dict], args: argparse.Namespace) -> None:
         "hold_steps": args.hold_steps,
         "branch_strength": args.branch_strength,
         "positive_dual": args.positive_dual,
+        "recenter_scale": args.recenter_scale,
+        "recenter_noise": args.recenter_noise,
+        "flip_audit": not args.skip_flip_audit,
     }
-    text_fields = {"optimizer"}
+    text_fields = {"optimizer", "flip_audit"}
     for row in rows:
         for field, value in expected.items():
             observed = row.get(field, "")

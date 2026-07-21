@@ -33,12 +33,20 @@ REOPENING_MODES = (
     "dual_positive_hold",
     "random_branch",
     "gain_branch",
+    "global_y_zero_once",
+    "global_y_zero_hold",
+    "global_y_zero_resetopt",
+    "global_soft_recenter",
+    "full_random_restart",
 )
 REOPENING_HOLD_MODES = (
     "dual_zero_hold",
     "dual_positive_hold",
     "random_branch",
     "gain_branch",
+    "global_y_zero_hold",
+    "global_y_zero_resetopt",
+    "global_soft_recenter",
 )
 REOPENING_GAIN_MODES = (
     "dual_zero_once",
@@ -47,6 +55,13 @@ REOPENING_GAIN_MODES = (
     "gain_branch",
 )
 REOPENING_BRANCH_MODES = ("random_kick", "random_branch", "gain_branch")
+REOPENING_GLOBAL_MODES = (
+    "global_y_zero_once",
+    "global_y_zero_hold",
+    "global_y_zero_resetopt",
+    "global_soft_recenter",
+    "full_random_restart",
+)
 
 
 @dataclass(frozen=True)
@@ -231,6 +246,8 @@ class PDBO_JAX:
             reopening_dual_value: float = 0.0,
             reopening_positive_value: float = 0.5,
             reopening_reset_optimizer: bool = True,
+            reopening_recenter_scale: float = 0.2,
+            reopening_noise: float = 0.01,
             dual_init_mode: str = 'constant',
             hessian_init_level: float = 0.0,
             curvature_tol: float = 1e-12,
@@ -292,6 +309,10 @@ class PDBO_JAX:
             raise ValueError("reopening_dual_value must be finite")
         if not np.isfinite(reopening_positive_value) or reopening_positive_value <= 0.0:
             raise ValueError("reopening_positive_value must be positive and finite")
+        if not (0.0 <= reopening_recenter_scale <= 1.0):
+            raise ValueError("reopening_recenter_scale must lie in [0, 1]")
+        if not (0.0 <= reopening_noise <= 0.5):
+            raise ValueError("reopening_noise must lie in [0, 0.5]")
         if reopening_mode != 'none' and objective_type != 'quadratic':
             raise ValueError("reopening strategies currently require a quadratic objective")
 
@@ -302,6 +323,7 @@ class PDBO_JAX:
         self.tolerance = tolerance
         self.primal_lr = primal_lr
         self.dual_lr = dual_lr
+        self.dual_init = dual_init
         self.dual_init_mode = dual_init_mode
         self.hessian_init_level = hessian_init_level
         self.curvature_tol = curvature_tol
@@ -339,6 +361,8 @@ class PDBO_JAX:
         self.reopening_dual_value = reopening_dual_value
         self.reopening_positive_value = reopening_positive_value
         self.reopening_reset_optimizer = reopening_reset_optimizer
+        self.reopening_recenter_scale = reopening_recenter_scale
+        self.reopening_noise = reopening_noise
         self.stop_reason = None
         self.perturbation_count = 0
         self.reopening_count = 0
@@ -607,8 +631,9 @@ class PDBO_JAX:
         diagnostic_grad_fn = jax.jit(grad_x_fn) if self.state_callback is not None else None
         reopening_enabled = self.reopening_mode != "none" and self.reopening_max_events > 0
         reopening_holds_dual = self.reopening_mode in REOPENING_HOLD_MODES
+        reopening_is_global = self.reopening_mode in REOPENING_GLOBAL_MODES
 
-        if reopening_enabled:
+        if reopening_enabled and not reopening_is_global:
             objective_grad_fn = jax.jit(jax.vmap(jax.grad(self.objective_fn), in_axes=0))
             diagonal = jnp.zeros(self.n, dtype=self.Q_values.dtype)
             diagonal_values = jnp.where(
@@ -667,53 +692,99 @@ class PDBO_JAX:
         def apply_reopening(step: int) -> None:
             nonlocal dual_hold_mask, dual_hold_value, dual_hold_until, next_reopening_step
 
-            rounded, flip_gains = exact_flip_gains(self.primal)
-            if self.reopening_mode in REOPENING_GAIN_MODES:
-                selected_gains, selected_indices = jax.lax.top_k(
-                    -flip_gains,
-                    variables_per_row,
+            if reopening_is_global:
+                selected_mask = jnp.ones_like(self.primal, dtype=jnp.bool_)
+                selected_rows = self.batch_size
+                selected_variables = self.n
+                event_stats = jnp.asarray(
+                    [
+                        jnp.nan,
+                        jnp.nan,
+                        jnp.nan,
+                        jnp.nan,
+                        self.dual.mean(),
+                    ],
+                    dtype=jnp.float32,
                 )
-                selected_gains = -selected_gains
             else:
-                self.key, score_key = jax.random.split(self.key)
-                random_scores = jax.random.uniform(score_key, flip_gains.shape)
-                _, selected_indices = jax.lax.top_k(random_scores, variables_per_row)
+                rounded, flip_gains = exact_flip_gains(self.primal)
+                if self.reopening_mode in REOPENING_GAIN_MODES:
+                    selected_gains, selected_indices = jax.lax.top_k(
+                        -flip_gains,
+                        variables_per_row,
+                    )
+                    selected_gains = -selected_gains
+                else:
+                    self.key, score_key = jax.random.split(self.key)
+                    random_scores = jax.random.uniform(score_key, flip_gains.shape)
+                    _, selected_indices = jax.lax.top_k(random_scores, variables_per_row)
+                    batch_indices = jnp.arange(self.batch_size)[:, jnp.newaxis]
+                    selected_gains = flip_gains[batch_indices, selected_indices]
+
                 batch_indices = jnp.arange(self.batch_size)[:, jnp.newaxis]
-                selected_gains = flip_gains[batch_indices, selected_indices]
+                row_is_active = jnp.arange(self.batch_size) >= active_start
+                selected_mask = jnp.zeros_like(self.primal, dtype=jnp.bool_)
+                selected_mask = selected_mask.at[batch_indices, selected_indices].set(
+                    row_is_active[:, jnp.newaxis]
+                )
 
-            batch_indices = jnp.arange(self.batch_size)[:, jnp.newaxis]
-            row_is_active = jnp.arange(self.batch_size) >= active_start
-            selected_mask = jnp.zeros_like(self.primal, dtype=jnp.bool_)
-            selected_mask = selected_mask.at[batch_indices, selected_indices].set(
-                row_is_active[:, jnp.newaxis]
-            )
-
-            active_gains = flip_gains[active_start:]
-            active_selected_gains = selected_gains[active_start:]
-            event_stats = jnp.asarray(
-                [
-                    active_gains.min(),
-                    jnp.mean(jnp.sum(active_gains < -1e-6, axis=1)),
-                    jnp.mean(jnp.any(active_gains < -1e-6, axis=1)),
-                    active_selected_gains.mean(),
-                    jnp.sum(jnp.where(selected_mask, self.dual, 0.0))
-                    / float(active_rows * variables_per_row),
-                ],
-                dtype=jnp.float32,
-            )
+                active_gains = flip_gains[active_start:]
+                active_selected_gains = selected_gains[active_start:]
+                event_stats = jnp.asarray(
+                    [
+                        active_gains.min(),
+                        jnp.mean(jnp.sum(active_gains < -1e-6, axis=1)),
+                        jnp.mean(jnp.any(active_gains < -1e-6, axis=1)),
+                        active_selected_gains.mean(),
+                        jnp.sum(jnp.where(selected_mask, self.dual, 0.0))
+                        / float(active_rows * variables_per_row),
+                    ],
+                    dtype=jnp.float32,
+                )
+                selected_rows = active_rows
+                selected_variables = variables_per_row
             event_stats.block_until_ready()
 
             modifies_dual = self.reopening_mode != "random_kick"
-            modifies_primal = self.reopening_mode in REOPENING_BRANCH_MODES
-            if self.reopening_mode == "dual_positive_hold":
+            modifies_primal = (
+                self.reopening_mode in REOPENING_BRANCH_MODES
+                or self.reopening_mode in {"global_soft_recenter", "full_random_restart"}
+            )
+            if self.reopening_mode == "full_random_restart":
+                target_dual = self.dual_init
+            elif self.reopening_mode == "dual_positive_hold":
                 target_dual = self.reopening_positive_value
             else:
                 target_dual = self.reopening_dual_value
 
-            if modifies_dual:
+            if self.reopening_mode == "full_random_restart":
+                self.key, restart_key = jax.random.split(self.key)
+                self.primal = jax.random.uniform(
+                    restart_key,
+                    self.primal.shape,
+                    dtype=self.primal.dtype,
+                )
+                self.dual = jnp.full_like(self.dual, self.dual_init)
+                self.opt_state_primal = self.optimizer_primal.init(self.primal)
+            elif self.reopening_mode == "global_soft_recenter":
+                self.key, noise_key = jax.random.split(self.key)
+                noise = jax.random.uniform(
+                    noise_key,
+                    self.primal.shape,
+                    minval=-self.reopening_noise,
+                    maxval=self.reopening_noise,
+                )
+                self.primal = jnp.clip(
+                    0.5 + self.reopening_recenter_scale * (self.primal - 0.5) + noise,
+                    0.0,
+                    1.0,
+                )
+                self.dual = jnp.full_like(self.dual, target_dual)
+                self.opt_state_primal = self.optimizer_primal.init(self.primal)
+            elif modifies_dual:
                 self.dual = jnp.where(selected_mask, target_dual, self.dual)
 
-            if modifies_primal:
+            if modifies_primal and not reopening_is_global:
                 current_values = self.primal[batch_indices, selected_indices]
                 if self.reopening_mode == "gain_branch":
                     selected_bits = rounded[batch_indices, selected_indices]
@@ -739,6 +810,9 @@ class PDBO_JAX:
                 if self.reopening_reset_optimizer:
                     self._reset_primal_optimizer_entries(selected_mask)
 
+            if self.reopening_mode == "global_y_zero_resetopt":
+                self.opt_state_primal = self.optimizer_primal.init(self.primal)
+
             if reopening_holds_dual:
                 dual_hold_mask = selected_mask
                 dual_hold_value = jnp.asarray(target_dual, dtype=self.dual.dtype)
@@ -751,9 +825,9 @@ class PDBO_JAX:
                     "step": int(step),
                     "mode": self.reopening_mode,
                     "objective_before": float(self.objVal),
-                    "selected_rows": int(active_rows),
-                    "variables_per_row": int(variables_per_row),
-                    "selected_coordinates": int(active_rows * variables_per_row),
+                    "selected_rows": int(selected_rows),
+                    "variables_per_row": int(selected_variables),
+                    "selected_coordinates": int(selected_rows * selected_variables),
                     "dual_target": float(target_dual) if modifies_dual else float("nan"),
                     "hold_steps": int(self.reopening_hold_steps) if reopening_holds_dual else 0,
                     "best_one_flip_objective_gain": float(stats[0]),
