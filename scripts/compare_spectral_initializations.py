@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pdbo import PDBOSolver, generate_max_cut, parse_gset  # noqa: E402
 from pdbo.curvature import quadratic_hessian  # noqa: E402
+from scipy.sparse.linalg import eigsh  # noqa: E402
 
 
 MODES = (
@@ -308,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subspace_dim",
         type=int,
-        default=16,
+        default=32,
         help="number of lowest-eigenvalue vectors used by spectral_subspace_random",
     )
     parser.add_argument(
@@ -342,7 +343,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional final randomized rounding samples per relaxed trajectory",
     )
     parser.add_argument("--check_every", type=int, default=10)
-    parser.add_argument("--eig_basis", type=int, default=16)
+    parser.add_argument("--eig_basis", type=int, default=32)
+    parser.add_argument(
+        "--spectral_basis",
+        type=int,
+        default=32,
+        help="number of smallest Hessian eigenvectors to compute/cache",
+    )
+    parser.add_argument(
+        "--spectral_cache_dir",
+        default="results/spectral_cache",
+        help="directory for cached low-eigenpair .npz files",
+    )
+    parser.add_argument(
+        "--no_spectral_cache",
+        action="store_true",
+        help="recompute spectral data instead of reading/writing the cache",
+    )
     parser.add_argument("--allow_missing", action="store_true")
     parser.add_argument("--out", default="spectral_init_compare.csv")
     return parser
@@ -415,11 +432,56 @@ def dual_init_for_mode(mode: str, args) -> float:
     return args.dual_init if value is None else value
 
 
-def load_spectral_data(data: dict) -> SpectralData:
+def required_spectral_basis(args, n: int) -> int:
+    if args.spectral_basis is not None:
+        k = args.spectral_basis
+    else:
+        k = max(2, args.eig_basis, args.subspace_dim, args.subset_size)
+        if "spectral_ranked" in args.modes:
+            k = max(k, args.subspace_dim)
+    if k < 2:
+        raise ValueError("--spectral_basis must be at least 2")
+    return min(k, n)
+
+
+def _spectral_cache_path(instance: str, data: dict, k: int, args) -> str:
+    safe_instance = instance.replace(os.sep, "_")
+    filename = f"{safe_instance}_n{data['num_vars']}_m{data['num_edges']}_k{k}.npz"
+    return os.path.join(args.spectral_cache_dir, filename)
+
+
+def load_spectral_data(data: dict, instance: str, args) -> SpectralData:
+    k = required_spectral_basis(args, data["num_vars"])
+    cache_path = _spectral_cache_path(instance, data, k, args)
+    if not args.no_spectral_cache and os.path.exists(cache_path):
+        cached = np.load(cache_path)
+        values = cached["values"].astype(np.float64)
+        vectors = cached["vectors"].astype(np.float64)
+        if values.shape == (k,) and vectors.shape == (data["num_vars"], k):
+            print(f"{instance}: loaded {k} cached Hessian eigenpairs from {cache_path}")
+            return SpectralData(values=values, vectors=vectors)
+        print(f"{instance}: ignoring incompatible spectral cache at {cache_path}")
+
     hessian = quadratic_hessian(data["Q_indices"], data["Q_values"], data["num_vars"])
-    dense = hessian.toarray()
-    values, vectors = np.linalg.eigh(dense)
-    return SpectralData(values=values.astype(np.float64), vectors=vectors.astype(np.float64))
+    n = hessian.shape[0]
+    if k >= n or n <= 256:
+        dense = hessian.toarray()
+        values, vectors = np.linalg.eigh(dense)
+        values = values[:k]
+        vectors = vectors[:, :k]
+    else:
+        values, vectors = eigsh(hessian, k=k, which="SA", tol=1e-8)
+        order = np.argsort(values)
+        values = values[order]
+        vectors = vectors[:, order]
+
+    values = values.astype(np.float64)
+    vectors = vectors.astype(np.float64)
+    if not args.no_spectral_cache:
+        os.makedirs(args.spectral_cache_dir, exist_ok=True)
+        np.savez_compressed(cache_path, values=values, vectors=vectors)
+        print(f"{instance}: saved {k} Hessian eigenpairs to {cache_path}")
+    return SpectralData(values=values, vectors=vectors)
 
 
 def spectral_rank_coefficients(n: int, power: float) -> np.ndarray:
@@ -507,7 +569,7 @@ def make_initial_primal(
     if mode == "spectral_single_random":
         if subspace_dim < 1:
             raise ValueError("subspace_dim must be positive")
-        k = min(subspace_dim, n)
+        k = min(subspace_dim, spectral.vectors.shape[1])
         choices = rng.integers(0, k, size=batch)
         signs = rng.choice(np.array([-1.0, 1.0]), size=batch)
         directions = spectral.vectors[:, choices].T * signs[:, np.newaxis]
@@ -519,13 +581,14 @@ def make_initial_primal(
         return _scale_direction_to_box(directions, radius).astype(np.float32)
 
     if mode == "spectral_ranked":
-        coeff = spectral_rank_coefficients(n, mixture_power)
-        coeffs = np.broadcast_to(coeff, (batch, n)).copy()
+        k = spectral.vectors.shape[1]
+        coeff = spectral_rank_coefficients(k, mixture_power)
+        coeffs = np.broadcast_to(coeff, (batch, k)).copy()
         if mixture_signs == "random":
-            coeffs *= rng.choice(np.array([-1.0, 1.0]), size=(batch, n))
+            coeffs *= rng.choice(np.array([-1.0, 1.0]), size=(batch, k))
         elif mixture_signs != "positive":
             raise ValueError("mixture_signs must be 'random' or 'positive'")
-        directions = coeffs @ spectral.vectors.T
+        directions = coeffs @ spectral.vectors[:, :k].T
         return _scale_direction_to_box(directions, radius).astype(np.float32)
 
     if subspace_dim < 1:
@@ -535,12 +598,12 @@ def make_initial_primal(
     if subspace_power_min > subspace_power_max:
         raise ValueError("subspace_power_min must be <= subspace_power_max")
 
-    k = min(subspace_dim, n)
+    k = min(subspace_dim, spectral.vectors.shape[1])
     if mode == "spectral_subset_random":
         if subset_size < 1:
             raise ValueError("subset_size must be positive")
         m = min(subset_size, k)
-        coeffs = np.zeros((batch, n), dtype=np.float64)
+        coeffs = np.zeros((batch, k), dtype=np.float64)
         for row in range(batch):
             chosen = np.sort(rng.choice(k, size=m, replace=False))
             powers = rng.uniform(subspace_power_min, subspace_power_max)
@@ -551,10 +614,10 @@ def make_initial_primal(
 
     ranks = np.arange(1, k + 1, dtype=np.float64)
     powers = rng.uniform(subspace_power_min, subspace_power_max, size=(batch, 1))
-    coeffs = np.zeros((batch, n), dtype=np.float64)
+    coeffs = np.zeros((batch, k), dtype=np.float64)
     coeffs[:, :k] = 1.0 / np.power(ranks[np.newaxis, :], powers)
     coeffs[:, :k] *= rng.choice(np.array([-1.0, 1.0]), size=(batch, k))
-    directions = coeffs @ spectral.vectors.T
+    directions = coeffs @ spectral.vectors[:, :k].T
     return _scale_direction_to_box(directions, radius).astype(np.float32)
 
 
@@ -763,8 +826,9 @@ def main() -> int:
         writer.writeheader()
         for gid, data in instances:
             instance = f"G{gid}"
-            print(f"{instance}: computing full Hessian eigendecomposition ...")
-            spectral = load_spectral_data(data)
+            k = required_spectral_basis(args, data["num_vars"])
+            print(f"{instance}: loading/computing {k} smallest Hessian eigenpairs ...")
+            spectral = load_spectral_data(data, instance, args)
             for seed in args.seeds:
                 for mode in args.modes:
                     row = run_one(instance, data, spectral, mode, seed, args)
