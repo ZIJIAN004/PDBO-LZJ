@@ -609,7 +609,7 @@ def make_initial_primal(
             powers = rng.uniform(subspace_power_min, subspace_power_max)
             coeffs[row, chosen] = 1.0 / np.power(chosen + 1.0, powers)
             coeffs[row, chosen] *= rng.choice(np.array([-1.0, 1.0]), size=m)
-        directions = coeffs @ spectral.vectors.T
+        directions = coeffs @ spectral.vectors[:, :k].T
         return _scale_direction_to_box(directions, radius).astype(np.float32)
 
     ranks = np.arange(1, k + 1, dtype=np.float64)

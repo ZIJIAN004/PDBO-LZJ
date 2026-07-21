@@ -147,3 +147,21 @@ def test_hybrid_random_spectral_combines_random_and_spectral_batches():
     assert np.all(primal >= 0.0)
     assert np.all(primal <= 1.0)
     assert np.unique(np.round(primal, decimals=8), axis=0).shape[0] > 6
+
+
+def test_subset_random_handles_cached_basis_larger_than_subset():
+    spectral = _tiny_spectral_data()
+    primal = spectral_script.make_initial_primal(
+        "spectral_subset_random",
+        spectral,
+        batch=6,
+        seed=7,
+        radius=0.45,
+        subspace_dim=4,
+        subset_size=2,
+    )
+
+    assert primal.shape == (6, 4)
+    assert np.all(primal >= 0.0)
+    assert np.all(primal <= 1.0)
+    assert np.unique(np.round(primal, decimals=8), axis=0).shape[0] > 2
