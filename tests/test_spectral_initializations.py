@@ -165,3 +165,21 @@ def test_subset_random_handles_cached_basis_larger_than_subset():
     assert np.all(primal >= 0.0)
     assert np.all(primal <= 1.0)
     assert np.unique(np.round(primal, decimals=8), axis=0).shape[0] > 2
+
+
+def test_random_plus_spectral_keeps_full_batch_diversity():
+    spectral = _tiny_spectral_data()
+    primal = spectral_script.make_initial_primal(
+        "random_plus_spectral",
+        spectral,
+        batch=8,
+        seed=8,
+        radius=0.45,
+        subspace_dim=4,
+        spectral_bias=0.1,
+    )
+
+    assert primal.shape == (8, 4)
+    assert np.all(primal >= 0.0)
+    assert np.all(primal <= 1.0)
+    assert np.unique(np.round(primal, decimals=8), axis=0).shape[0] == 8

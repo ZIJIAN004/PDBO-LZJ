@@ -15,6 +15,8 @@ controls fixed:
                       a few randomly selected low-eigenvalue vectors per batch member
     hybrid_random_spectral
                       part uniform random, part randomized low-spectral-subspace
+    random_plus_spectral
+                      full-space random directions with a weak low-spectral bias
 
 Example:
     python scripts/compare_spectral_initializations.py --gset_ids 1 2 3 4 5 6 7 8 9 10 \
@@ -52,6 +54,7 @@ MODES = (
     "spectral_single_random",
     "spectral_subset_random",
     "hybrid_random_spectral",
+    "random_plus_spectral",
 )
 
 FIELDNAMES = (
@@ -253,6 +256,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="override constant y value for hybrid random/spectral initialization",
     )
     parser.add_argument(
+        "--random_plus_spectral_hessian_level",
+        type=float,
+        default=None,
+        help="override r for random-plus-spectral-bias initialization",
+    )
+    parser.add_argument(
+        "--random_plus_spectral_dual_init_mode",
+        choices=["constant", "curvature"],
+        default=None,
+        help="override y initialization mode for random-plus-spectral-bias initialization",
+    )
+    parser.add_argument(
+        "--random_plus_spectral_dual_init",
+        type=float,
+        default=None,
+        help="override constant y value for random-plus-spectral-bias initialization",
+    )
+    parser.add_argument(
         "--spectral_single_random_hessian_level",
         type=float,
         default=None,
@@ -331,6 +352,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="fraction of hybrid batch initialized from the randomized spectral subspace",
     )
     parser.add_argument(
+        "--spectral_bias",
+        type=float,
+        default=0.1,
+        help="low-spectral bias strength for random_plus_spectral; 0=random, 1=mostly spectral",
+    )
+    parser.add_argument(
         "--subset_size",
         type=int,
         default=4,
@@ -395,6 +422,7 @@ def hessian_level_for_mode(mode: str, args) -> float:
         "spectral_ranked": args.spectral_ranked_hessian_level,
         "spectral_subspace_random": args.spectral_subspace_random_hessian_level,
         "hybrid_random_spectral": args.hybrid_random_spectral_hessian_level,
+        "random_plus_spectral": args.random_plus_spectral_hessian_level,
         "spectral_single_random": args.spectral_single_random_hessian_level,
         "spectral_subset_random": args.spectral_subset_random_hessian_level,
     }
@@ -410,6 +438,7 @@ def dual_init_mode_for_mode(mode: str, args) -> str:
         "spectral_ranked": args.spectral_ranked_dual_init_mode,
         "spectral_subspace_random": args.spectral_subspace_random_dual_init_mode,
         "hybrid_random_spectral": args.hybrid_random_spectral_dual_init_mode,
+        "random_plus_spectral": args.random_plus_spectral_dual_init_mode,
         "spectral_single_random": args.spectral_single_random_dual_init_mode,
         "spectral_subset_random": args.spectral_subset_random_dual_init_mode,
     }
@@ -425,6 +454,7 @@ def dual_init_for_mode(mode: str, args) -> float:
         "spectral_ranked": args.spectral_ranked_dual_init,
         "spectral_subspace_random": args.spectral_subspace_random_dual_init,
         "hybrid_random_spectral": args.hybrid_random_spectral_dual_init,
+        "random_plus_spectral": args.random_plus_spectral_dual_init,
         "spectral_single_random": args.spectral_single_random_dual_init,
         "spectral_subset_random": args.spectral_subset_random_dual_init,
     }
@@ -507,10 +537,11 @@ def make_initial_primal(
     radius: float,
     mixture_power: float = 1.0,
     mixture_signs: str = "random",
-    subspace_dim: int = 16,
+    subspace_dim: int = 32,
     subspace_power_min: float = 0.5,
     subspace_power_max: float = 1.5,
     hybrid_spectral_fraction: float = 0.5,
+    spectral_bias: float = 0.1,
     subset_size: int = 4,
 ) -> np.ndarray:
     if mode not in MODES:
@@ -534,6 +565,29 @@ def make_initial_primal(
             dtype=jnp.float32,
         )
         return np.asarray(primal, dtype=np.float32)
+
+    if mode == "random_plus_spectral":
+        if not (0.0 <= spectral_bias <= 1.0):
+            raise ValueError("spectral_bias must lie in [0, 1]")
+        random_primal = make_initial_primal(
+            "random",
+            spectral,
+            batch=batch,
+            seed=seed,
+            radius=radius,
+        ).astype(np.float64)
+        spectral_primal = make_initial_primal(
+            "spectral_subspace_random",
+            spectral,
+            batch=batch,
+            seed=seed + 2_000_003,
+            radius=radius,
+            subspace_dim=subspace_dim,
+            subspace_power_min=subspace_power_min,
+            subspace_power_max=subspace_power_max,
+        ).astype(np.float64)
+        direction = (random_primal - 0.5) + spectral_bias * (spectral_primal - 0.5)
+        return _scale_direction_to_box(direction, radius).astype(np.float32)
 
     if mode == "hybrid_random_spectral":
         if not (0.0 <= hybrid_spectral_fraction <= 1.0):
@@ -695,6 +749,7 @@ def run_one(instance: str, data: dict, spectral: SpectralData, mode: str, seed: 
             subspace_power_min=args.subspace_power_min,
             subspace_power_max=args.subspace_power_max,
             hybrid_spectral_fraction=args.hybrid_spectral_fraction,
+            spectral_bias=args.spectral_bias,
             subset_size=args.subset_size,
         )
         rounded0 = np.rint(primal0).astype(np.float64)
@@ -786,6 +841,7 @@ def main() -> int:
         ("--spectral_ranked_hessian_level", args.spectral_ranked_hessian_level),
         ("--spectral_subspace_random_hessian_level", args.spectral_subspace_random_hessian_level),
         ("--hybrid_random_spectral_hessian_level", args.hybrid_random_spectral_hessian_level),
+        ("--random_plus_spectral_hessian_level", args.random_plus_spectral_hessian_level),
         ("--spectral_single_random_hessian_level", args.spectral_single_random_hessian_level),
         ("--spectral_subset_random_hessian_level", args.spectral_subset_random_hessian_level),
     ):
@@ -803,6 +859,9 @@ def main() -> int:
         return 2
     if not (0.0 <= args.hybrid_spectral_fraction <= 1.0):
         print("--hybrid_spectral_fraction must be in [0, 1]", file=sys.stderr)
+        return 2
+    if not (0.0 <= args.spectral_bias <= 1.0):
+        print("--spectral_bias must be in [0, 1]", file=sys.stderr)
         return 2
     if args.subset_size < 1:
         print("--subset_size must be positive", file=sys.stderr)
@@ -839,7 +898,7 @@ def main() -> int:
                         print(
                             f"{instance:<4} seed={seed:<3} mode={mode:<15} "
                             f"init={row['initial_cut_best']:>8.1f} final={row['final_cut']:>8.1f} "
-                            f"v1={row['energy_v1_mean']:.3f}"
+                            f"iter={row['last_improve_iter']:>5} v1={row['energy_v1_mean']:.3f}"
                         )
                     else:
                         print(
