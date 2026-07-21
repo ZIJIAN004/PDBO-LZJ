@@ -180,6 +180,8 @@ class PDBO_JAX:
             verbose: bool = True,
             primal_init: str = 'uniform',
             step_callback: Optional[Callable] = None,
+            state_callback: Optional[Callable] = None,
+            state_callback_every: int = 100,
             incumbent_score_fn: Optional[Callable] = None,
             patience: Optional[int] = None,
             min_delta: float = 0.0,
@@ -225,6 +227,8 @@ class PDBO_JAX:
             raise ValueError("patience must be positive or None")
         if check_every < 1:
             raise ValueError("check_every must be positive")
+        if state_callback_every < 1:
+            raise ValueError("state_callback_every must be positive")
         if rounding_samples < 0:
             raise ValueError("rounding_samples must be non-negative")
         if perturbation_fraction < 0.0 or perturbation_fraction > 1.0:
@@ -248,6 +252,8 @@ class PDBO_JAX:
         self.timelimit = timelimit
         self.verbose = verbose
         self.step_callback = step_callback
+        self.state_callback = state_callback
+        self.state_callback_every = state_callback_every
         self.incumbent_score_fn = incumbent_score_fn
         self.patience = patience
         self.min_delta = min_delta
@@ -510,6 +516,7 @@ class PDBO_JAX:
             return (y * g_fn(x)).sum()
 
         grad_x_fn = jax.grad(lambda x, y: base_term(x) + penalty_term(x, y), argnums=0)
+        diagnostic_grad_fn = jax.jit(grad_x_fn) if self.state_callback is not None else None
 
         @jax.jit
         def primal_dual_update(x: jnp.ndarray, y: jnp.ndarray, opt_state_x, opt_state_y, objVal, incumbent):
@@ -546,9 +553,17 @@ class PDBO_JAX:
              self.incumbent) = primal_dual_update(
                 self.primal, self.dual, self.opt_state_primal, self.opt_state_dual, self.objVal, self.incumbent)
 
+            state_callback_due = (
+                    self.state_callback is not None
+                    and (
+                            (_step + 1) % self.state_callback_every == 0
+                            or _step == self.max_iters - 1
+                    )
+            )
             should_check = (
                     self.verbose
                     or self.step_callback is not None
+                    or state_callback_due
                     or (_step + 1) % self.check_every == 0
                     or _step == self.max_iters - 1
             )
@@ -564,6 +579,18 @@ class PDBO_JAX:
                 if self.step_callback is not None:
                     self.incumbent.block_until_ready()
                     self.step_callback(_step, step_time, self.objVal, self.incumbent)
+                if state_callback_due:
+                    diagnostic_gradient = diagnostic_grad_fn(self.primal, self.dual)
+                    diagnostic_gradient.block_until_ready()
+                    self.state_callback(
+                        _step,
+                        self.primal,
+                        self.dual,
+                        diagnostic_gradient,
+                        self.objVal,
+                        self.incumbent,
+                        last_improvement_step,
+                    )
                 if self.timelimit is not None and time.perf_counter() - self.start_time >= self.timelimit:
                     self.stop_reason = "timelimit"
                     break
@@ -649,6 +676,8 @@ class PDQUBO_JAX(PDBO_JAX):
             verbose: bool = True,
             primal_init: str = 'uniform',
             step_callback: Optional[Callable] = None,
+            state_callback: Optional[Callable] = None,
+            state_callback_every: int = 100,
             incumbent_score_fn: Optional[Callable] = None,
             patience: Optional[int] = None,
             min_delta: float = 0.0,
@@ -690,6 +719,8 @@ class PDQUBO_JAX(PDBO_JAX):
             verbose=verbose,
             primal_init=primal_init,
             step_callback=step_callback,
+            state_callback=state_callback,
+            state_callback_every=state_callback_every,
             incumbent_score_fn=incumbent_score_fn,
             patience=patience,
             min_delta=min_delta,
