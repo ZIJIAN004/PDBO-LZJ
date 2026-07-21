@@ -199,9 +199,10 @@ class PDBO_JAX:
             curvature_tol: float = 1e-12,
             eig_tol: float = 1e-8,
             trusted_objective_hessian_lambda_min: Optional[float] = None,
+            primal_initial_values: Optional[np.ndarray] = None,
     ):
         assert objective_type in {'quadratic', 'custom'}, "Invalid objective type"
-        assert optimizer_type in {'rmsprop', 'adam'}, "Invalid optimizer type"
+        assert optimizer_type in {'sgd', 'rmsprop', 'adam'}, "Invalid optimizer type"
         assert primal_init in {'uniform', 'half', 'binary'}, "Invalid primal init"
         assert quadratic_backend in {'edge', 'sparse'}, "Invalid quadratic backend"
         assert g_type in G_TYPES, f"Invalid g_type: {g_type}"
@@ -296,6 +297,8 @@ class PDBO_JAX:
             self.objective_fn = objective_fn
 
         self.primal, self.dual = self._init_variables(dual_init, primal_init)
+        if primal_initial_values is not None:
+            self.primal = self._validate_primal_initial_values(primal_initial_values)
         self.initial_curvature_diagnostics = None
         self.initial_g_curvature_min = None
         self.initial_g_curvature_max = None
@@ -357,6 +360,25 @@ class PDBO_JAX:
         dual = jnp.full((self.batch_size, self.n), dual_init, dtype=jnp.float32)
         return primal, dual
 
+    def _validate_primal_initial_values(self, values: np.ndarray) -> jnp.ndarray:
+        """Validate and batch a caller-supplied primal initialization."""
+        supplied = np.asarray(values)
+        if np.iscomplexobj(supplied):
+            raise TypeError("primal_initial_values must be real-valued")
+        if supplied.shape == (self.n,):
+            supplied = np.broadcast_to(supplied, (self.batch_size, self.n)).copy()
+        elif supplied.shape != (self.batch_size, self.n):
+            raise ValueError(
+                "primal_initial_values must have shape "
+                f"({self.n},) or ({self.batch_size}, {self.n})"
+            )
+        supplied = np.asarray(supplied, dtype=np.float32)
+        if not np.isfinite(supplied).all():
+            raise ValueError("primal_initial_values must all be finite")
+        if np.any(supplied < 0.0) or np.any(supplied > 1.0):
+            raise ValueError("primal_initial_values must lie in [0, 1]")
+        return jnp.asarray(supplied)
+
     def _initialize_curvature_matched_dual(self):
         """Match every initial Hessian to a common relative curvature level.
 
@@ -389,6 +411,8 @@ class PDBO_JAX:
         self.initial_g_curvature_max = float(np.max(curvature))
 
     def _configure_optimizer(self, optimizer_type: str, lr: float) -> optax.GradientTransformation:
+        if optimizer_type == 'sgd':
+            return optax.sgd(lr)
         if optimizer_type == 'rmsprop':
             return optax.rmsprop(lr, decay=0.98, eps=1e-8, momentum=0.91)
         return optax.adam(lr, b1=0.9, b2=0.999, eps=1e-8)
